@@ -1,0 +1,27 @@
+# Configuration for graph path-finding experiments
+train: graph_paths
+valid: graph_paths
+tokenizer_name_or_path: graph_paths
+cache_dir: ${cwd:}/data
+wrap: False
+streaming: False
+
+# Graph parameters
+num_nodes: 100
+num_seeds: 0
+graph_type: bernoulli  # bernoulli, fixed-degree, or hierarchical
+edge_prob: 0.05
+out_degree: 4  # For fixed-degree graph type
+num_layers: 5  # For hierarchical graph type
+
+# Dataset sizes
+num_train_samples: 5000
+num_test_samples: 1000
+
+# Prefixes for different task types
+prefixes:
+  - path
+  - edge
+
+# Whether to regenerate the dataset even if cached
+regenerate: False

@@ -20,6 +20,14 @@ import utils
 
 LOGGER = utils.get_logger(__name__)
 
+# Import custom graph path data module
+try:
+  import data as graph_data
+  GRAPH_DATA_AVAILABLE = True
+except ImportError:
+  GRAPH_DATA_AVAILABLE = False
+  LOGGER.warning("Graph path data module not available.")
+
 
 def wt_detokenizer(string):
   # contractions
@@ -488,6 +496,12 @@ def get_dataset(
 def get_tokenizer(config):
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
+  elif config.data.tokenizer_name_or_path == 'graph_paths':
+    if not GRAPH_DATA_AVAILABLE:
+      raise ImportError(
+        "Graph path data module not available. "
+        "Make sure data.py is in your Python path.")
+    tokenizer = graph_data.get_graph_path_tokenizer(config)
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
       from_pretrained('bert-base-uncased')
@@ -524,6 +538,14 @@ def get_tokenizer(config):
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
+  # Handle graph path datasets separately
+  if config.data.train == 'graph_paths':
+    if not GRAPH_DATA_AVAILABLE:
+      raise ImportError(
+        "Graph path data module not available. "
+        "Make sure data.py is in your Python path.")
+    return graph_data.get_graph_path_dataloaders(config, tokenizer)
+
   num_gpus = torch.cuda.device_count()
   assert (config.loader.global_batch_size
           == (config.loader.batch_size
