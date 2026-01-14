@@ -241,7 +241,7 @@ class DDiTBlock(nn.Module):
       return bias_dropout_add_scale_fused_inference
 
 
-  def forward(self, x, rotary_cos_sin, c, seqlens=None):
+  def forward(self, x, rotary_cos_sin, c, attention_mask=None, seqlens=None):
     batch_size, seq_len = x.shape[0], x.shape[1]
 
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
@@ -253,26 +253,66 @@ class DDiTBlock(nn.Module):
     x_skip = x
     x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
 
+    # qkv = self.attn_qkv(x)
+    # qkv = rearrange(qkv,
+    #                 'b s (three h d) -> b s three h d',
+    #                 three=3,
+    #                 h=self.n_heads)
+    # with torch.cuda.amp.autocast(enabled=False):
+    #   cos, sin = rotary_cos_sin
+    #   qkv = apply_rotary_pos_emb(
+    #     qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+    # qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+    # if seqlens is None:
+    #   cu_seqlens = torch.arange(
+    #     0, (batch_size + 1) * seq_len, step=seq_len,
+    #     dtype=torch.int32, device=qkv.device)
+    # else:
+    #   cu_seqlens = seqlens.cumsum(-1)
+    # x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
+    #   qkv, cu_seqlens, seq_len, 0., causal=False)
+    #
+    # x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+
     qkv = self.attn_qkv(x)
-    qkv = rearrange(qkv,
-                    'b s (three h d) -> b s three h d',
-                    three=3,
-                    h=self.n_heads)
+    qkv = rearrange(
+      qkv, "b s (three h d) -> b s three h d", three=3, h=self.n_heads
+    )
+
     with torch.cuda.amp.autocast(enabled=False):
       cos, sin = rotary_cos_sin
-      qkv = apply_rotary_pos_emb(
-        qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-    qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-    if seqlens is None:
+      qkv = apply_rotary_pos_emb(qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+
+    # FlashAttention dense path assumes all tokens are real.
+    # If we have padding (any zeros in attention_mask), fall back to SDPA with a key mask.
+    use_flash = True
+    if attention_mask is not None:
+      am = attention_mask.to(torch.bool)
+      use_flash = bool(am.all())
+
+    if use_flash:
+      qkv_flat = rearrange(qkv, "b s ... -> (b s) ...")
       cu_seqlens = torch.arange(
         0, (batch_size + 1) * seq_len, step=seq_len,
-        dtype=torch.int32, device=qkv.device)
+        dtype=torch.int32, device=qkv_flat.device
+      )
+      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
+        qkv_flat, cu_seqlens, seq_len, 0., causal=False
+      )
+      x = rearrange(x, "(b s) h d -> b s (h d)", b=batch_size)
+
     else:
-      cu_seqlens = seqlens.cumsum(-1)
-    x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-      qkv, cu_seqlens, seq_len, 0., causal=False)
-    
-    x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+      # SDPA path: mask is True for keys that participate.
+      q, k, v = qkv.unbind(dim=2)  # each: (b, s, h, d)
+      q = q.permute(0, 2, 1, 3)  # (b, h, s, d)
+      k = k.permute(0, 2, 1, 3)
+      v = v.permute(0, 2, 1, 3)
+
+      key_mask = am[:, None, None, :]  # (b, 1, 1, s), True = allowed
+      attn = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=key_mask, dropout_p=0.0, is_causal=False
+      )
+      x = attn.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
 
     x = bias_dropout_scale_fn(self.attn_out(x),
                               None,
@@ -356,7 +396,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma):
+  def forward(self, indices, sigma, attention_mask=None):
     x = self.vocab_embed(indices)
     c = F.silu(self.sigma_map(sigma))
 
@@ -364,7 +404,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
-        x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+        x = self.blocks[i](x, rotary_cos_sin, c, attention_mask=attention_mask, seqlens=None)
       x = self.output_layer(x, c)
 
     return x

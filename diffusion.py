@@ -76,6 +76,19 @@ class Diffusion(L.LightningModule):
 
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
+
+    # --- class-dependent masking ratios (optional) ---
+    ratios = self.config.training.get("class_mask_ratios", None)
+    if ratios is None:
+      self.class_mask_ratios = None
+    else:
+      ratios = torch.tensor(ratios, dtype=torch.float32)
+      V = len(self.tokenizer)  # important: includes added special tokens
+      if ratios.numel() != V:
+        raise ValueError(f"class_mask_ratios has length {ratios.numel()} but tokenizer has {V} tokens")
+      self.register_buffer("class_mask_ratios", ratios)
+    # -----------------------------------------------
+
     self.sampler = self.config.sampling.predictor
     self.gen_ppl_eval_model_name_or_path = self.config.eval.\
       gen_ppl_eval_model_name_or_path
@@ -309,12 +322,15 @@ class Diffusion(L.LightningModule):
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
-  def forward(self, x, sigma):
+  def forward(self, x, sigma, attention_mask=None):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma)
-    
+      if attention_mask is not None and self.config.backbone == "dit":
+        logits = self.backbone(x, sigma, attention_mask=attention_mask)
+      else:
+        logits = self.backbone(x, sigma)
+
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
                                          xt=x)
@@ -572,18 +588,29 @@ class Diffusion(L.LightningModule):
         self.gen_ppl_metric.update(
           nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
-  def q_xt(self, x, move_chance):
-    """Computes the noisy sample xt.
-
-    Args:
-      x: int torch.Tensor with shape (batch_size,
-          diffusion_model_input_length), input. 
-      move_chance: float torch.Tensor with shape (batch_size, 1).
+  def q_xt(self, x, move_chance, attention_mask=None):
+      """
+    x: LongTensor [B, L] (x0 clean tokens)
+    move_chance: FloatTensor [B, 1] base masking prob m(t)
+    attention_mask: optional [B, L], 1=real token, 0=padding
     """
-    move_indices = torch.rand(
-      * x.shape, device=x.device) < move_chance
-    xt = torch.where(move_indices, self.mask_index, x)
-    return xt
+      # Base per-position prob p_ij = m(t_i)
+      p = move_chance
+      if p.ndim == 2 and p.shape[1] == 1:
+          p = p.expand(-1, x.shape[1])  # [B, L]
+
+      # Optional per-class scaling: p_ij = clamp(m(t_i) * ratio[x_ij], 0, 1)
+      ratios = getattr(self, "class_mask_ratios", None)
+      if ratios is not None:
+          p = torch.clamp(p * ratios[x], 0.0, 1.0)
+
+      # Never mask padding positions
+      if attention_mask is not None:
+          p = p * attention_mask.to(dtype=p.dtype)
+
+      move_indices = torch.rand_like(p) < p
+      xt = torch.where(move_indices, self.mask_index, x)
+      return xt
 
   def _sample_prior(self, *batch_dims):
     return self.mask_index * torch.ones(
@@ -660,6 +687,14 @@ class Diffusion(L.LightningModule):
     batch_size_per_gpu = self.config.loader.eval_batch_size
     if self.parameterization == 'ar':
       return self._ar_sampler(batch_size_per_gpu)
+
+    if self.sampler == 'top_prob_margin':
+      return self._top_prob_margin_sampler(
+        batch_size=batch_size_per_gpu,
+        max_steps=num_steps if num_steps is not None else self.config.sampling.steps,
+        eps=eps
+      )
+
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
@@ -695,6 +730,87 @@ class Diffusion(L.LightningModule):
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
+    return x
+
+  def _attention_mask_from_first_eos(self, x: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B, L] token ids
+    returns: [B, L] int mask, 1 = real token, 0 = padding-after-EOS
+    """
+    eos = self.tokenizer.eos_token_id
+    if eos is None:
+      return torch.ones_like(x, dtype=torch.long)
+
+    B, L = x.shape
+    is_eos = (x == eos)
+    has_eos = is_eos.any(dim=1)
+
+    first = torch.full((B,), L, device=x.device, dtype=torch.long)
+    if has_eos.any():
+      first[has_eos] = is_eos[has_eos].float().argmax(dim=1)
+
+    ar = torch.arange(L, device=x.device)[None, :]
+    attn = (ar <= first[:, None])  # bool
+    return attn.to(dtype=torch.long)
+
+  def _enforce_eos_suffix(self, x: torch.Tensor) -> torch.Tensor:
+    eos = self.tokenizer.eos_token_id
+    if eos is None:
+      return x
+
+    attn = self._attention_mask_from_first_eos(x)  # 1 up to first EOS, 0 after
+    # Force all positions after first EOS to EOS (even if previously unmasked)
+    x = torch.where(attn.to(torch.bool), x, torch.full_like(x, eos))
+    return x
+
+  @torch.no_grad()
+  def _top_prob_margin_sampler(self, batch_size, max_steps=None, eps=1e-5):
+    B = batch_size
+    L = self.config.model.length
+    mask = self.mask_index
+    oracle_noise = getattr(self.config.sampling, "oracle_noise", 0.0)
+
+    if max_steps is None:
+      max_steps = L
+
+    x = self._sample_prior(B, L).to(self.device)  # usually all [MASK]
+    batch_idx = torch.arange(B, device=x.device)
+
+    for _ in range(max_steps):
+      # Enforce EOS suffix rule, then derive mask for attention
+      x = self._enforce_eos_suffix(x)
+      attention_mask = self._attention_mask_from_first_eos(x)
+
+      masked = (x == mask)  # [B, L]
+      has_mask = masked.any(dim=1)  # [B]
+      if not has_mask.any():
+        break
+
+      # time proxy: fraction masked
+      t = masked.float().mean(dim=1).clamp(min=eps)  # [B]
+      sigma, _ = self.noise(t)  # [B] or [B,1] depending schedule
+
+      logp = self.forward(x, sigma, attention_mask=attention_mask)  # [B,L,V]
+      p = logp.exp()
+
+      top2 = torch.topk(p, k=2, dim=-1).values  # [B,L,2]
+      margin = top2[..., 0] - top2[..., 1]  # [B,L]
+      margin = margin.masked_fill(~masked, float("-inf"))
+
+      if oracle_noise and oracle_noise > 0:
+        margin = margin + oracle_noise * torch.randn_like(margin)
+
+      pos = margin.argmax(dim=1)  # [B]
+      dist = p[batch_idx, pos, :]  # [B,V]
+      tok = _sample_categorical(dist)  # [B]
+
+      # Only update sequences that still have masks
+      active = has_mask
+      x[batch_idx[active], pos[active]] = tok[active]
+
+      # Immediately apply EOS suffix if EOS was chosen
+      x = self._enforce_eos_suffix(x)
+
     return x
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
@@ -844,7 +960,7 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
-  def _forward_pass_diffusion(self, x0):
+  def _forward_pass_diffusion(self, x0, attention_mask=None):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
@@ -863,8 +979,8 @@ class Diffusion(L.LightningModule):
       unet_conditioning = sigma[:, None]
       move_chance = 1 - torch.exp(-sigma[:, None])
 
-    xt = self.q_xt(x0, move_chance)
-    model_output = self.forward(xt, unet_conditioning)
+    xt = self.q_xt(x0, move_chance, attention_mask=attention_mask)
+    model_output = self.forward(xt, unet_conditioning, attention_mask=attention_mask)
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
@@ -903,7 +1019,7 @@ class Diffusion(L.LightningModule):
       loss = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
+      loss = self._forward_pass_diffusion(input_tokens, attention_mask=attention_mask)
     
     nlls = loss * attention_mask
     count = attention_mask.sum()

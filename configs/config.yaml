@@ -27,8 +27,8 @@ loader:
   pin_memory: True
 
 sampling:
-  predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
-  steps: 128
+  predictor: top_prob_margin  # analytic, ddpm, ddpm_cache
+  steps: ${model.length}
   noise_removal: True
   # TODO(yair): @subham, why aren't these params under `eval`?
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
@@ -43,6 +43,7 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  class_mask_ratios: null
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
